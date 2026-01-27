@@ -1,0 +1,14 @@
+[
+  {
+    "name": "ingest_timestamp",
+    "type": "TIMESTAMP"
+  },
+  {
+    "name": "pubsub_message_id",
+    "type": "STRING"
+  },
+  {
+    "name": "raw_data",
+    "type": "STRING"
+  }
+]

@@ -1,90 +1,88 @@
-import os
 import json
 import base64
+import logging
+import os
 import uuid
 from flask import Flask, request
-from google.cloud import pubsub_v1
 
-PROJECT_ID = os.environ["PROJECT_ID"]
-OUT_TOPIC_ID = os.environ["OUT_TOPIC_ID"]
-
-publisher = pubsub_v1.PublisherClient()
-out_topic_path = publisher.topic_path(PROJECT_ID, OUT_TOPIC_ID)
+# Configure logging
+logging.basicConfig(level=logging.INFO)
 
 app = Flask(__name__)
 
+@app.route("/_ah/warmup")
+def warmup():
+    """Handle Cloud Run warmup requests."""
+    return ("", 200)
+
 @app.route("/", methods=["POST"])
-def handle_message():
-    envelope = request.get_json(silent=True)
-    if not envelope or "message" not in envelope:
-        print("Bad request: missing 'message' field")
-        return ("Bad Request", 400)
-
-    msg = envelope["message"]
-    data = msg.get("data")
-    if not data:
-        print("No data in message")
-        return ("No data", 400)
-
-    # Decode Pub/Sub message
+def process_outage():
     try:
-        payload = json.loads(base64.b64decode(data).decode("utf-8"))
+        # Lazy imports — critical for cold start performance
+        from google.cloud import pubsub_v1, firestore
+
+        PROJECT_ID = os.environ["PROJECT_ID"]
+        OUTAGE_TOPIC = f"projects/{PROJECT_ID}/topics/outages"
+        publisher = pubsub_v1.PublisherClient()
+        db = firestore.Client()
+
+        envelope = request.get_json()
+        if not envelope or "message" not in envelope:
+            logging.warning("Bad request: missing 'message' field")
+            return "Bad Request", 400
+
+        pubsub_message = envelope["message"]
+        if "data" not in pubsub_message:
+            logging.warning("Bad request: missing 'data' in message")
+            return "Bad Request", 400
+
+        data = json.loads(base64.b64decode(pubsub_message["data"]).decode("utf-8"))
+        logging.info(f"📥 Received SCADA event: {data}")
+
+        device_id = data["device_id"]
+        new_status = data["status"]
+        event_time = data["timestamp"]
+
+        doc_ref = db.collection("device_status").document(device_id)
+        doc = doc_ref.get()
+        current_state = doc.to_dict() if doc.exists else None
+        logging.info(f"🔍 Device {device_id} state: {current_state}")
+
+        if new_status == "OFF":
+            if not current_state or current_state.get("status") != "OFF":
+                outage_id = str(uuid.uuid4())
+                outage_event = {
+                    "outage_id": outage_id,
+                    "device_id": device_id,
+                    "start_time": event_time,
+                    "status": "ACTIVE"
+                }
+
+                future = publisher.publish(OUTAGE_TOPIC, json.dumps(outage_event).encode("utf-8"))
+                future.result(timeout=10)  # Wait for publish
+                logging.info(f"✅ Published outage: {outage_id}")
+
+                doc_ref.set({
+                    "status": "OFF",
+                    "outage_id": outage_id,
+                    "last_update": firestore.SERVER_TIMESTAMP
+                })
+                logging.info(f"💾 Saved OFF state for {device_id}")
+            else:
+                logging.info(f"⏭️ Duplicate OFF event for {device_id} — skipped")
+
+        elif new_status == "ON":
+            if current_state and current_state.get("status") == "OFF":
+                doc_ref.set({
+                    "status": "ON",
+                    "last_update": firestore.SERVER_TIMESTAMP
+                })
+                logging.info(f"🔌 Device {device_id} restored to ON")
+
+        return ("", 204)
+
     except Exception as e:
-        print(f"Failed to decode message: {e}")
-        return ("Bad Request", 400)
-
-    # SCADA messages may contain a single device or a list of devices
-    devices = payload if isinstance(payload, list) else [payload]
-
-    outages = []  # Collect all outages for batch publishing
-
-    for event in devices:
-        measurements = event.get("measurements", {})
-        voltage = measurements.get("voltage_kv")  # None if missing
-        current = measurements.get("current_a")
-        state = event.get("state", "UNKNOWN")
-        asset = event.get("asset")  # Could be None
-        event_id = event.get("event_id") or str(uuid.uuid4())
-        timestamp = event.get("timestamp") or None
-
-        # Determine if this is an outage
-        is_outage = (voltage is not None and voltage < 10) or (state.upper() == "DOWN")
-
-        if is_outage:
-            if not asset or not timestamp:
-                print(f"Skipping outage: missing asset or timestamp: {event}")
-                continue
-
-            outage_event = {
-                "incident_type": "OUTAGE_DETECTED",
-                "event_id": event_id,
-                "asset": asset,
-                "detected_by": "outage-processor",
-                "reason": "voltage<10kV or state=DOWN",
-                "voltage_kv": voltage,
-                "current_a": current,
-                "state": state,
-                "timestamp": timestamp,
-            }
-
-            outages.append(outage_event)
-        else:
-            print(f"Ignored normal message: {event}")
-
-    # Batch publish if we have any outages
-    if outages:
-        try:
-            publisher.publish(
-                out_topic_path,
-                json.dumps(outages).encode("utf-8"),
-            )
-            print(f"Published batch of {len(outages)} outages")
-        except Exception as e:
-            print(f"Failed to publish batch: {e}")
-
-    return ("", 204)
-
-
-@app.route("/health", methods=["GET"])
-def health():
-    return "OK", 200
+        # 🔥 ADD THIS LINE TO SEE THE ACTUAL ERROR MESSAGE
+        logging.error(f"🔥 FATAL ERROR: {str(e)}")
+        logging.exception("Full traceback:")
+        return ("Error", 500)

@@ -1,3 +1,4 @@
-Flask==3.0.0
-google-cloud-pubsub==2.21.0
-gunicorn
+flask
+google-cloud-pubsub
+google-cloud-bigquery
+pydantic
