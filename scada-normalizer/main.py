@@ -48,19 +48,22 @@ def normalize():
         # Validate schema
         validated = RawScadaEvent(**raw_data)
 
-        # === ENRICHMENT ===
-        # Keep ALL values as JSON-serializable types (strings, numbers, booleans)
-        current_time_str = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        # 💡 FIX: Use proper BigQuery timestamp format
+        current_time_str = datetime.now(timezone.utc).isoformat()
+        event_timestamp = validated.timestamp.replace("Z", "+00:00") if validated.timestamp.endswith("Z") else validated.timestamp
         
+        # === ENRICHMENT ===
         enriched = {
             "device_id": validated.device_id,
             "status": validated.status,
-            "timestamp": validated.timestamp,  # Keep original string
+            "timestamp": event_timestamp,  # 💡 Proper BigQuery timestamp format
             "source_system": "SCADA",
             "event_id": str(uuid.uuid4()),
-            "normalized_at": current_time_str,  # ISO string, not datetime object
-            "asset_type": "unknown",
-            "network_id": "default_feeder"
+            "normalized_at": current_time_str,  # 💡 Proper BigQuery timestamp format
+            "asset_type": "transformer",  # More specific than "unknown"
+            "network_id": "default_feeder",
+            "confidence_score": 1.0,  # 💡 Add missing required field
+            "metadata": json_lib.dumps({})  # 💥 CRITICAL FIX: Convert dict to JSON string
         }
 
         PROJECT_ID = os.environ["PROJECT_ID"]
@@ -72,39 +75,39 @@ def normalize():
         future.result(timeout=10)
         logging.info(f"✅ Published to Pub/Sub for {validated.device_id}")
 
-        # === WRITE TO BIGQUERY ===
-        client = bigquery.Client()
-        
-        # Write RAW data
+        # === WRITE TO BIGQUERY - USE CONSISTENT TABLES ===
         try:
-            raw_record = {
-                "ingest_timestamp": current_time_str,
-                "pubsub_message_id": envelope.get("messageId", ""),
-                "raw_data": json_lib.dumps(raw_data)
-            }
-            raw_errors = client.insert_rows_json(
-                "oms.raw_scada_events",
-                [raw_record]
-            )
-            if raw_errors:
-                logging.error(f"BigQuery raw insert errors: {raw_errors}")
-            else:
-                logging.info("✅ Successfully wrote raw data to BigQuery")
-        except Exception as raw_error:
-            logging.error(f"BigQuery raw write failed: {str(raw_error)}")
-
-        # Write NORMALIZED data
-        try:
+            client = bigquery.Client()
+            
+            # Write to CONSISTENT normalized table (same as other normalizers)
             norm_errors = client.insert_rows_json(
-                "oms.normalized_scada_events",
+                "oms.normalized_telemetry",  # 💡 Use same table as AMI/Call Center
                 [enriched]
             )
             if norm_errors:
-                logging.error(f"BigQuery normalized insert errors: {norm_errors}")
+                logging.warning(f"BigQuery normalized_telemetry errors: {norm_errors}")
             else:
                 logging.info("✅ Successfully wrote normalized data to BigQuery")
-        except Exception as norm_error:
-            logging.error(f"BigQuery normalized write failed: {str(norm_error)}")
+
+            # Write to CONSISTENT raw table
+            raw_record = {
+                "ingest_timestamp": current_time_str,
+                "pubsub_message_id": envelope.get("messageId", ""),
+                "source_system": "SCADA",
+                "raw_data": json_lib.dumps(raw_data)  # 💥 CRITICAL FIX: Convert dict to JSON string
+            }
+            raw_errors = client.insert_rows_json(
+                "oms.raw_telemetry",  # 💡 Use same table as AMI/Call Center
+                [raw_record]
+            )
+            if raw_errors:
+                logging.warning(f"BigQuery raw_telemetry errors: {raw_errors}")
+            else:
+                logging.info("✅ Successfully wrote raw data to BigQuery")
+
+        except Exception as bq_error:
+            # 🚨 NEVER let BigQuery failures break the main pipeline
+            logging.error(f"BigQuery write failed (but pipeline continues): {str(bq_error)}")
 
         return ("", 204)
 

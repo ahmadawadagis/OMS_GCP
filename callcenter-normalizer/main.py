@@ -1,4 +1,3 @@
-# callcenter-normalizer/main.py
 import json as json_lib
 import base64
 import logging
@@ -6,6 +5,7 @@ import os
 import uuid
 from datetime import datetime, timezone
 from flask import Flask, request
+from google.cloud import pubsub_v1, bigquery
 
 logging.basicConfig(level=logging.INFO)
 app = Flask(__name__)
@@ -28,21 +28,25 @@ def normalize():
         raw_data = json_lib.loads(base64.b64decode(pubsub_message["data"]).decode("utf-8"))
         logging.info(f"📞 Received Call Center: {raw_data}")
 
+        # 💡 FIX: Use proper BigQuery timestamp format
+        normalized_timestamp = datetime.now(timezone.utc).isoformat()
+        event_timestamp = raw_data["call_timestamp"].replace("Z", "+00:00") if raw_data["call_timestamp"].endswith("Z") else raw_data["call_timestamp"]
+
         enriched = {
             "event_id": str(uuid.uuid4()),
             "source_system": "CALL_CENTER",
             "device_id": raw_data["customer_account_id"],
             "status": "OUTAGE_REPORTED",
-            "timestamp": raw_data["call_timestamp"],
-            "normalized_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "timestamp": event_timestamp,  # 💡 Proper BigQuery timestamp format
+            "normalized_at": normalized_timestamp,  # 💡 Proper BigQuery timestamp format
             "asset_type": "customer",
             "network_id": raw_data.get("service_address_feeder", "unknown"),
             "confidence_score": 0.7,
-            "metadata": {
+            "metadata": json_lib.dumps({  # 💥 CRITICAL FIX: Convert dict to JSON string
                 "caller_name": raw_data.get("caller_name"),
                 "issue_description": raw_data.get("issue_description"),
                 "call_duration_sec": raw_data.get("call_duration_sec")
-            }
+            })
         }
 
         PROJECT_ID = os.environ["PROJECT_ID"]
@@ -62,10 +66,10 @@ def normalize():
             
             # Write raw data  
             raw_record = {
-                "ingest_timestamp": enriched["normalized_at"],
+                "ingest_timestamp": normalized_timestamp,  # 💡 Match timestamp format
                 "pubsub_message_id": envelope.get("messageId", ""),
                 "source_system": "CALL_CENTER",
-                "raw_data": json_lib.dumps(raw_data)
+                "raw_data": json_lib.dumps(raw_data)  # ✅ Already correct in your code
             }
             errors2 = client.insert_rows_json("oms.raw_telemetry", [raw_record])
             if errors2:
