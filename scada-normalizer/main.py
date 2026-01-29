@@ -66,7 +66,7 @@ def normalize():
         PROJECT_ID = os.environ["PROJECT_ID"]
 
         # === PUBLISH TO PUB/SUB ===
-        OUTPUT_TOPIC = f"projects/{PROJECT_ID}/topics/scada-normalized"
+        OUTPUT_TOPIC = f"projects/{PROJECT_ID}/topics/telemetry-normalized"
         publisher = pubsub_v1.PublisherClient()
         future = publisher.publish(OUTPUT_TOPIC, json_lib.dumps(enriched).encode("utf-8"))
         future.result(timeout=10)
